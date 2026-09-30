@@ -287,6 +287,7 @@ function render() {
   $('#view-title').textContent = VIEW_TITLES[ui.view];
   $('#month-switch').hidden = ui.view === 'forecast' || ui.view === 'settings';
   $('#month-label').textContent = monthLong(ui.month);
+  $('#lock-btn').hidden = !getPin();
   $('#month-label').title = ui.month === monthKey(todayStr()) ? 'Mois en cours' : 'Revenir au mois en cours';
 
   Object.values(charts).forEach((c) => c.destroy());
@@ -827,6 +828,18 @@ function renderSettings() {
         </div>
 
         <div class="card">
+          <div class="card-head"><h3>Sécurité</h3></div>
+          <div class="setting-row">
+            <div><h4>Code PIN ${getPin() ? '<span class="badge" style="background:var(--income-soft);color:var(--income)">Activé</span>' : ''}</h4>
+              <p>${getPin() ? "Demandé à l'ouverture et après 1 minute en arrière-plan." : "Demander un code à 4-6 chiffres à l'ouverture de l'app."}</p></div>
+            <div style="display:flex;gap:8px">${getPin()
+              ? '<button class="btn btn-sm" data-action="pin-change">Modifier</button><button class="btn btn-sm btn-danger" data-action="pin-off">Désactiver</button>'
+              : '<button class="btn btn-sm btn-primary" data-action="pin-on">Activer</button>'}</div>
+          </div>
+          <p class="small muted" style="margin:8px 0 0">Le code empêche d'ouvrir l'app sur cet appareil. Il ne chiffre pas les données : gardez aussi votre téléphone et votre ordinateur verrouillés.</p>
+        </div>
+
+        <div class="card">
           <div class="card-head"><h3>Opérations mensuelles</h3><span class="small muted">${rules.length} au total</span></div>
           ${rules.length ? `<div class="tx-list">${rules.map((r) => {
             const c = cat(r.categoryId);
@@ -1108,6 +1121,152 @@ function loadDemo() {
 }
 
 /* =========================================================
+   Code PIN (verrouillage de l'app sur cet appareil)
+   Le code est stocké haché (SHA-256 + sel), séparément des données,
+   pour ne pas être inclus dans les sauvegardes ni effacé avec elles.
+   ========================================================= */
+const PIN_KEY = 'pilotage-depenses:pin';
+const AUTO_LOCK_MS = 60_000;
+const MAX_TRIES = 5;
+const COOLDOWN_MS = 30_000;
+
+function getPin() {
+  try { return JSON.parse(localStorage.getItem(PIN_KEY) || 'null'); } catch { return null; }
+}
+function setPin(v) {
+  try { v ? localStorage.setItem(PIN_KEY, JSON.stringify(v)) : localStorage.removeItem(PIN_KEY); return true; } catch { return false; }
+}
+async function hashPin(pin, salt) {
+  const data = new TextEncoder().encode(`${salt}:${pin}`);
+  const buf = await crypto.subtle.digest('SHA-256', data);
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+async function checkPin(pin) {
+  const p = getPin();
+  return !!p && (await hashPin(pin, p.salt)) === p.hash;
+}
+async function savePin(pin) {
+  const salt = uid() + uid();
+  return setPin({ hash: await hashPin(pin, salt), salt, len: pin.length, fails: 0, until: 0 });
+}
+
+const lock = { locked: false, entry: '', busy: false, timer: null };
+
+function showLock() {
+  closeModal();
+  lock.locked = true;
+  lock.entry = '';
+  document.body.classList.add('locked');
+  $('#lock').hidden = false;
+  updateLock();
+}
+function hideLock() {
+  lock.locked = false;
+  lock.entry = '';
+  document.body.classList.remove('locked');
+  $('#lock').hidden = true;
+  clearInterval(lock.timer);
+  render();
+}
+function updateLock(msg = '') {
+  const p = getPin();
+  if (!p) return hideLock();
+  $('#pin-dots').innerHTML = Array.from({ length: p.len }, (_, i) => `<span class="${i < lock.entry.length ? 'on' : ''}"></span>`).join('');
+  const wait = Math.ceil(((p.until || 0) - Date.now()) / 1000);
+  $$('#lock .keypad button').forEach((b) => { b.disabled = wait > 0 && b.dataset.key !== 'forgot'; });
+  $('#lock-msg').textContent = wait > 0 ? `Trop d'essais. Réessayez dans ${wait} s.` : msg;
+  clearInterval(lock.timer);
+  if (wait > 0) lock.timer = setInterval(() => updateLock(), 1000);
+}
+async function pressKey(key) {
+  const p = getPin();
+  if (!p || lock.busy) return;
+  if (key === 'forgot') return forgotPin();
+  if ((p.until || 0) > Date.now()) return;
+  if (key === 'del') lock.entry = lock.entry.slice(0, -1);
+  else if (lock.entry.length < p.len) lock.entry += key;
+  updateLock();
+  if (lock.entry.length < p.len) return;
+
+  lock.busy = true;
+  const ok = await checkPin(lock.entry);
+  lock.busy = false;
+  if (ok) {
+    setPin({ ...p, fails: 0, until: 0 });
+    return hideLock();
+  }
+  const fails = (p.fails || 0) + 1;
+  const blocked = fails >= MAX_TRIES;
+  setPin({ ...p, fails: blocked ? 0 : fails, until: blocked ? Date.now() + COOLDOWN_MS : 0 });
+  lock.entry = '';
+  const dots = $('#pin-dots');
+  dots.classList.remove('shake'); void dots.offsetWidth; dots.classList.add('shake');
+  const left = MAX_TRIES - fails;
+  updateLock(blocked ? '' : `Code incorrect (${left} essai${left > 1 ? 's' : ''} restant${left > 1 ? 's' : ''})`);
+}
+function forgotPin() {
+  if (!confirm("Code oublié ?\n\nSans le code, la seule solution est d'effacer TOUTES les données de l'application sur cet appareil (opérations, budgets, catégories).\n\nSi vous avez une sauvegarde (.json), vous pourrez la restaurer ensuite.")) return;
+  if (!confirm('Confirmer la suppression définitive de toutes les données ?')) return;
+  try { localStorage.removeItem(STORAGE_KEY); } catch { /* stockage indisponible */ }
+  setPin(null);
+  state = defaultState();
+  applyTheme();
+  hideLock();
+  toast('Données effacées. Vous pouvez restaurer une sauvegarde dans Réglages.');
+}
+
+/** mode : 'on' (activer) · 'change' (modifier) · 'off' (désactiver) */
+function openPinForm(mode) {
+  const needCurrent = mode !== 'on';
+  const needNew = mode !== 'off';
+  const field = (id, label) => `<label class="field">${label}<input id="${id}" class="pin-input" type="password" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off"></label>`;
+  const titles = { on: 'Activer le code PIN', change: 'Modifier le code PIN', off: 'Désactiver le code PIN' };
+  openModal(titles[mode], `
+    <form class="form" id="pin-form" novalidate>
+      ${needCurrent ? field('p-cur', 'Code actuel') : ''}
+      ${needNew ? field('p-new', 'Nouveau code (4 à 6 chiffres)') + field('p-conf', 'Confirmez le nouveau code') : ''}
+      ${mode === 'on' ? `<div class="insight"><div class="insight-icon" style="background:var(--warn-soft)">⚠️</div><p class="small">Si vous oubliez ce code, il faudra <strong>effacer les données</strong> pour rouvrir l'app. Faites une sauvegarde (Réglages → Sauvegarder) et gardez-la en lieu sûr.</p></div>` : ''}
+      <p class="small" id="p-err" style="color:var(--expense);margin:0" hidden></p>
+      <div class="form-actions"><div class="right">
+        <button type="button" class="btn" data-close>Annuler</button>
+        <button type="submit" class="btn ${mode === 'off' ? 'btn-danger' : 'btn-primary'}">${mode === 'off' ? 'Désactiver' : 'Enregistrer'}</button>
+      </div></div>
+    </form>`, (root) => {
+    $$('.pin-input', root).forEach((i) => i.addEventListener('input', () => { i.value = i.value.replace(/\D/g, '').slice(0, 6); }));
+    setTimeout(() => $('.pin-input', root)?.focus(), 50);
+    $('#pin-form', root).addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = $('#p-err', root);
+      const fail = (m) => { err.textContent = m; err.hidden = false; };
+      if (needCurrent && !(await checkPin($('#p-cur', root).value))) return fail('Code actuel incorrect.');
+      if (needNew) {
+        const n = $('#p-new', root).value;
+        if (!/^\d{4,6}$/.test(n)) return fail('Le code doit contenir de 4 à 6 chiffres.');
+        if (n !== $('#p-conf', root).value) return fail('Les deux codes ne correspondent pas.');
+        if (!(await savePin(n))) return fail("Impossible d'enregistrer le code sur cet appareil.");
+      } else {
+        setPin(null);
+      }
+      closeModal();
+      render();
+      toast({ on: 'Code PIN activé 🔒', change: 'Code PIN modifié', off: 'Code PIN désactivé' }[mode]);
+    });
+  });
+}
+
+// Reverrouillage automatique après 1 min en arrière-plan
+let hiddenAt = null;
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) hiddenAt = Date.now();
+  else if (getPin() && !lock.locked && hiddenAt && Date.now() - hiddenAt > AUTO_LOCK_MS) showLock();
+});
+$('#lock').addEventListener('click', (e) => {
+  const k = e.target.closest('[data-key]');
+  if (k && !k.disabled) pressKey(k.dataset.key);
+});
+$('#lock-btn').addEventListener('click', () => showLock());
+
+/* =========================================================
    Événements globaux
    ========================================================= */
 function setView(v) {
@@ -1133,6 +1292,9 @@ document.addEventListener('click', (e) => {
     case 'edit-rule': { const rule = state.recurring.find((r) => r.id === id); if (rule) openTxForm({ rule }); break; }
     case 'budget': openBudgetForm(id); break;
     case 'demo': loadDemo(); break;
+    case 'pin-on': openPinForm('on'); break;
+    case 'pin-change': openPinForm('change'); break;
+    case 'pin-off': openPinForm('off'); break;
     case 'export-json': exportJSON(); break;
     case 'export-csv': exportCSV(); break;
     case 'import-json': {
@@ -1173,6 +1335,11 @@ document.addEventListener('click', (e) => {
 });
 
 document.addEventListener('keydown', (e) => {
+  if (lock.locked) {
+    if (/^\d$/.test(e.key)) pressKey(e.key);
+    else if (e.key === 'Backspace') pressKey('del');
+    return;
+  }
   if (e.key === 'Escape' && !$('#modal').hidden) closeModal();
   // Raccourci « n » : nouvelle opération
   if (e.key === 'n' && $('#modal').hidden && !/INPUT|TEXTAREA|SELECT/.test(document.activeElement?.tagName)) { e.preventDefault(); openTxForm(); }
@@ -1198,4 +1365,5 @@ if (window.Chart) {
   window.Chart = class { constructor(canvas) { canvas.replaceWith(Object.assign(document.createElement('p'), { className: 'muted small', textContent: 'Graphique indisponible hors connexion.' })); } destroy() {} };
 }
 applyTheme();
-render();
+if (getPin()) showLock();
+else render();

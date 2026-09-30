@@ -1,0 +1,4 @@
+# Données personnelles : ne jamais envoyer sur GitHub
+# (sauvegardes .json et exports .csv de l'application)
+*.json
+*.csv
