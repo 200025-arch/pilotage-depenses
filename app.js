@@ -815,6 +815,7 @@ function renderSettings() {
       <div class="stack">
         <div class="card">
           <div class="card-head"><h3>Général</h3></div>
+          ${installRow()}
           <div class="setting-row">
             <div><h4>Solde de départ</h4><p>Le montant sur votre compte avant votre première opération.</p></div>
             <div class="amount-input" style="width:170px"><input id="s-init" type="text" inputmode="decimal" style="font-size:16px;padding:9px 34px 9px 12px;text-align:right" value="${String(state.settings.initialBalance || 0).replace('.', ',')}"><span class="cur" style="font-size:15px;right:12px">€</span></div>
@@ -1267,6 +1268,52 @@ $('#lock').addEventListener('click', (e) => {
 $('#lock-btn').addEventListener('click', () => showLock());
 
 /* =========================================================
+   Application installable (PWA) + hors connexion
+   ========================================================= */
+let installPrompt = null;
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIOS = () => /iphone|ipad|ipod/i.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  installPrompt = e;
+  if (ui.view === 'settings' && !lock.locked) render();
+});
+window.addEventListener('appinstalled', () => {
+  installPrompt = null;
+  toast('Application installée ✨');
+  if (ui.view === 'settings' && !lock.locked) render();
+});
+async function installApp() {
+  if (!installPrompt) return;
+  installPrompt.prompt();
+  await installPrompt.userChoice;
+  installPrompt = null;
+  render();
+}
+function installRow() {
+  let action, text;
+  if (isStandalone()) {
+    text = "L'application est installée sur cet appareil et fonctionne hors connexion.";
+    action = '<span class="badge" style="background:var(--income-soft);color:var(--income)">Installée</span>';
+  } else if (installPrompt) {
+    text = "Ajoutez l'app à votre écran d'accueil : plein écran, icône dédiée, utilisable hors connexion.";
+    action = '<button class="btn btn-sm btn-primary" data-action="install">Installer</button>';
+  } else if (isIOS()) {
+    text = "Dans Safari, touchez <strong>Partager</strong> ⬆️ puis <strong>« Sur l'écran d'accueil »</strong>.";
+    action = '';
+  } else {
+    text = "Depuis votre téléphone, ouvrez le menu du navigateur puis <strong>« Ajouter à l'écran d'accueil »</strong> (ou <strong>« Installer l'application »</strong>).";
+    action = '';
+  }
+  return `<div class="setting-row"><div><h4>Application</h4><p>${text}</p></div>${action ? `<div>${action}</div>` : ''}</div>`;
+}
+
+if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => { /* hors ligne ou non supporté */ }));
+}
+
+/* =========================================================
    Événements globaux
    ========================================================= */
 function setView(v) {
@@ -1292,6 +1339,7 @@ document.addEventListener('click', (e) => {
     case 'edit-rule': { const rule = state.recurring.find((r) => r.id === id); if (rule) openTxForm({ rule }); break; }
     case 'budget': openBudgetForm(id); break;
     case 'demo': loadDemo(); break;
+    case 'install': installApp(); break;
     case 'pin-on': openPinForm('on'); break;
     case 'pin-change': openPinForm('change'); break;
     case 'pin-off': openPinForm('off'); break;
